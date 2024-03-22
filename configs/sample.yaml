@@ -6,17 +6,17 @@ trial_id: 0
 project_name: guided_protein_seq
 
 # provide this for comparing samples to gt
-data_dir: /scratch/nvg7279/datasets/sabdab_and_poas
+data_dir: /home/cemri/NOS/data
 val_fn: val_iid.csv 
 
 target_cols: ['ss_perc_sheet']
-vocab_file: /home/nvg7279/src/seq-struct/vocab.txt
+vocab_file: /home/cemri/NOS/vocab.txt
 
-log_dir: "/scratch/nvg7279/logs/guided_protein_seq"
+log_dir: "/home/cemri/NOS/scratch/logs/guided_protein_seq"
 exp_name: test_sample
 exp_dir: ${log_dir}/${exp_name}
 
-ckpt_path: /scratch/nvg7279/logs/guided_protein_seq/ar_mlm_test/models/best_by_valid/epoch=74-step=53700.ckpt
+ckpt_path: '/home/cemri/NOS/scratch/logs/guided_protein_seq/ar_mlm_test/models/best_by_valid/epoch-98-step-14157.ckpt'
 
 max_epochs: 100 #to avoid errors
 
@@ -27,8 +27,10 @@ vocab_size: 30
 
 ngpu: 1
 
-num_samples: 256
+num_samples: 50
 infill_seeds_fn: null
+
+dps_enable: False
 
 guidance_kwargs: null
 # guidance_kwargs:
