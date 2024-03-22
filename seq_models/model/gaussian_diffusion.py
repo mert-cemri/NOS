@@ -21,7 +21,8 @@ from transformers.models.bert.modeling_bert import (
     BertEmbeddings,
     BertOnlyMLMHead,
 )
-
+import transformers
+from seq_models.schedule.noise_schedule import _extract_into_tensor
 from seq_models.nets.regression import (
     RegressionHead,
     RegressionModel,
@@ -92,22 +93,22 @@ class GaussianDiffusionTransformer(nn.Module):
         x = x / x.norm(dim=-1, keepdim=True)
         x = np.sqrt(self.in_channels) * x
 
-        time_emb = self.time_embed(timestep_embedding(timesteps, self.time_embed_dim))
-
         emb_x = self.input_up_proj(x)
         seq_length = x.size(1)
         position_ids = self.position_ids[:, : seq_length ]
+        token_embed = self.position_embeddings(position_ids) + emb_x
+         
+        time_emb = self.time_embed(timestep_embedding(timesteps, self.time_embed_dim))
+        time_emb = time_emb.unsqueeze(1).expand(-1, seq_length, -1)
 
-        emb_inputs = self.position_embeddings(position_ids) + emb_x 
-        emb_inputs = emb_inputs + time_emb.unsqueeze(1).expand(-1, seq_length, -1)
-        emb_inputs = self.dropout(self.LayerNorm(emb_inputs))
+        emb_inputs = self.dropout(self.LayerNorm(token_embed + time_emb)) #encodings at the first layer
 
         attn_mask = attn_mask[:, None, None, :]
 
         encoder_outputs = self.encoder(emb_inputs, attention_mask=attn_mask)
-        sequence_output = encoder_outputs[0]
+        sequence_output = encoder_outputs[0] #enocodings at the last layer
 
-        prediction_scores = self.cls(sequence_output)
+        prediction_scores = self.cls(sequence_output) #dist over vocab for masked indices
 
         out = {
             "logits": prediction_scores,
@@ -193,10 +194,16 @@ class GaussianDiffusionTransformer(nn.Module):
         x, 
         timesteps, 
         attn_mask=None, 
-        sequence_output=None
+        sequence_output=None,
+        dps_enable = False
     ):
-        if sequence_output is None:
-            sequence_output = self.forward(x, timesteps, attn_mask)['sequence_output']
+        dps_enable = True
+        if dps_enable:
+            x_dps = self.pred_xstart(x, timesteps, attn_mask)['xstart']
+            sequence_output = self.forward(x_dps, timesteps, attn_mask)['sequence_output']
+        else:
+            if sequence_output is None:
+                sequence_output = self.forward(x, timesteps, attn_mask)['sequence_output']
         return self.regression_head(sequence_output)
 
     def guidance_score(
@@ -204,9 +211,10 @@ class GaussianDiffusionTransformer(nn.Module):
         x, 
         timesteps, 
         attn_mask=None,
-        sequence_output=None
+        sequence_output=None,
+        dps_enable = False
     ):
-        labels = self.get_labels(x, timesteps, attn_mask, sequence_output)
+        labels = self.get_labels(x, timesteps, attn_mask, sequence_output, dps_enable = dps_enable)
         return labels.sum(-1) 
 
 class GaussianDiffusion(BaseModel):
@@ -242,6 +250,7 @@ class GaussianDiffusion(BaseModel):
         attn_mask,
         labels=None,
         return_by_timestep=False,
+        dps_enable=False,
     ):
         timesteps = self.noise_schedule.timesteps
         t = torch.randint(
@@ -273,7 +282,7 @@ class GaussianDiffusion(BaseModel):
         out["accuracy"] = accuracy.mean()
 
         if labels is not None:
-            pred_labels = self.network.get_labels(x_t, t, attn_mask)
+            pred_labels = self.network.get_labels(x_t, t, attn_mask,dps_enable=dps_enable)
             regression_loss = (pred_labels - labels).pow(2)
             out["regression_mse"] = regression_loss.mean()
             out["regression_spearman"] = spearmanr(
@@ -312,6 +321,7 @@ class GaussianDiffusion(BaseModel):
         step_size=0.1,
         stability_coef=1e-2,
         num_steps=5,
+        dps_enable = False,
     ):
         if guidance_layer == "last":
             kl_loss = torch.nn.KLDivLoss(log_target=True)
@@ -329,6 +339,101 @@ class GaussianDiffusion(BaseModel):
 
         optimizer = torch.optim.Adagrad([delta], lr=step_size)
 
+        with torch.enable_grad():
+            # print("\n")
+            target_losses = []
+            for _ in range(num_steps):
+                if guidance_layer == "last":
+                    h_current = h + infill_mask * delta
+
+                    target_loss = self.network.guidance_score(
+                        None, t, attn_mask, sequence_output=h_current
+                    ).sum()
+                    new_logits = self.network.cls(h_current)
+                
+                    kl = kl_loss(new_logits, logits)
+                    loss = -target_loss + stability_coef * kl
+              
+                    # print(infill_mask[0,:,0])
+                    # print(h_current[0,:,0][infill_mask[0,:,0]])
+                    # print(target_loss.item())
+                    # print(kl.item())
+                    # print(delta.pow(2).mean())
+                    # print("")
+
+                elif guidance_layer == "first":
+                    x_current = x + infill_mask * delta
+                    target_loss = self.network.guidance_score(x_current, t, attn_mask, dps_enable = dps_enable).sum()
+                    nll = ((x_current - mean)  ** 2 / sigma).sum()
+                    loss = -target_loss + stability_coef * nll                
+                    target_losses.append(target_loss.detach().cpu().numpy())
+                    # print(target_loss.item())
+                    # print(nll.item())
+                    # print(delta.pow(2).mean())
+                    # print(self.network.regression_head.stop_grad)
+                    # print("")
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                    
+                # delta_grad_norm = delta.grad.norm(dim=(2), keepdim=True)
+                # delta.grad /= delta_grad_norm.clamp_min(1e-7)
+
+        if guidance_layer == "last":
+            p_out = self.network.posterior_sample(
+                self.noise_schedule,
+                x_prev, t, attn_mask, infill_mask, 
+                corrupt_mask, gt_vals,
+                sequence_output=(h + delta.data),
+                bad_word_ids=bad_word_ids
+            )
+            x, probs = p_out['x'], p_out['probs']
+        elif guidance_layer == "first":
+            x = x + delta.data
+            probs = self.network.pred_xstart(
+                x, t, attn_mask=attn_mask, bad_word_ids=bad_word_ids
+            )["probs"]
+        
+        return {
+            "x": x,
+            "probs": probs,
+            "target_losses":target_losses,
+        }
+
+    def dps_guidance_steps(
+        self,
+        model_output,
+        t,
+        attn_mask,
+        infill_mask,
+        bad_word_ids,
+        corrupt_mask=None,
+        gt_vals=None, 
+        guidance_layer="first",
+        step_size=0.1,
+        stability_coef=1e-2,
+        num_steps=5,
+        noise_schedule = None,
+        dps_enable = False,
+    ):
+        if guidance_layer == "last":
+            kl_loss = torch.nn.KLDivLoss(log_target=True)
+            x_prev = model_output['x_prev'].detach()
+            h = model_output['sequence_output'].detach()
+            logits = model_output['logits'].detach()
+            delta = torch.nn.Parameter(torch.zeros_like(h), requires_grad=True)
+        elif guidance_layer == "first":
+            x = model_output['x'].detach()
+            mean = model_output['mean'].detach()
+            sigma = model_output['sigma'].detach()
+            delta = torch.nn.Parameter(torch.zeros_like(x), requires_grad=True)
+        else:
+            raise NotImplementedError()
+
+        optimizer = torch.optim.Adagrad([delta], lr=step_size)
+
+        target_losses = []
         with torch.enable_grad():
             # print("\n")
             for _ in range(num_steps):
@@ -352,9 +457,25 @@ class GaussianDiffusion(BaseModel):
 
                 elif guidance_layer == "first":
                     x_current = x + infill_mask * delta
-                    target_loss = self.network.guidance_score(x_current, t, attn_mask).sum()
+                    
+                    # x_dps = (x_current + (1-_extract_into_tensor(noise_schedule.alphas_cumprod, t, x_current.shape) ) )/ _extract_into_tensor(noise_schedule.self.sqrt_alphas_cumprod, t, x_current.shape)
+                    x_dps = self.network.pred_xstart(x_current, t, attn_mask, bad_word_ids=bad_word_ids)['xstart']
+                    
+                    # print(x_dps.shape)
+                    # print(x_dps)
+                    # print("-------------------------------")
+                    # print(x_current.shape)
+                    # print(x_current)
+                    # #print(mean.shape)
+                    # #print(model_output['sequence_output'].shape)
+                    # assert False
+
+                    target_loss = self.network.guidance_score(x_dps, t, attn_mask).sum()
+
                     nll = ((x_current - mean)  ** 2 / sigma).sum()
-                    loss = -target_loss + stability_coef * nll                
+                    loss = -target_loss + stability_coef * nll      
+                    
+                    target_losses.append(target_loss.detach().cpu().numpy())          
 
                     # print(target_loss.item())
                     # print(nll.item())
@@ -387,8 +508,9 @@ class GaussianDiffusion(BaseModel):
         return {
             "x": x,
             "probs": probs,
+            "target_losses" : target_losses,
         }
-
+    
     def sample(
         self,
         infill_seed,
@@ -397,6 +519,8 @@ class GaussianDiffusion(BaseModel):
         num_samples,
         guidance_kwargs=None,
         bad_word_ids=None,
+        vocab_file=None,
+        dps_enable = False,
     ):
         device = next(self.parameters()).device
     
@@ -420,10 +544,12 @@ class GaussianDiffusion(BaseModel):
             (num_samples, infill_mask.shape[1]), dtype=torch.bool, device=device
         )
 
-        return_best = guidance_kwargs.pop("return_best", False) \
-            if guidance_kwargs is not None else False
+        # return_best = guidance_kwargs.pop("return_best", False) \
+        #     if guidance_kwargs is not None else False
+        return_best = False
 
         traj = []
+        all_target_losses = []
         for i in tqdm.tqdm(indices):
             t = torch.tensor([i] * num_samples, device=device)
 
@@ -448,24 +574,37 @@ class GaussianDiffusion(BaseModel):
             if guidance_kwargs is not None:
                 g_out = self.guidance_steps(
                     out, t, attn_mask, infill_mask, bad_word_ids, 
-                    **guidance_kwargs
+                    **guidance_kwargs, dps_enable=dps_enable
                 )
 
                 x = g_out['x']
                 probs = g_out['probs']
+                all_target_losses += g_out["target_losses"]
+                #np.save("/home/cemri/NOS/scratch/target_losses_dps_gaussian_vanilla.npy", np.array(all_target_losses))
 
             pred_ids = probs.argmax(-1) #greedy decoding
             pred_ids = torch.where(infill_mask.squeeze(-1), pred_ids, infill_seed[None])
             
             if guidance_kwargs is not None:
                 labels = self.network.guidance_score(
-                    self.network.get_embeds(pred_ids), t, attn_mask
+                    self.network.get_embeds(pred_ids), t, attn_mask, dps_enable=dps_enable
                 ).cpu().numpy()
                 pred_ids = (pred_ids.cpu().numpy(), labels)
             else:
                 pred_ids = pred_ids.cpu().numpy()
 
             traj.append(pred_ids)
+
+            tokenizer = transformers.BertTokenizerFast(
+                vocab_file=vocab_file, 
+                do_lower_case=False,
+            )
+            protein = [tokenizer.decode(s) for s in pred_ids[0]]
+            #print(protein)
+            #print([tokenizer.decode(s) for s in infill_seed])
+            #print(corrupt_mask)
+            #print([tokenizer.decode(s) for s in noisy_gt])
+            #print(infill_mask)
 
         if return_best:
             best_idx = np.argmax(np.stack([t[1] for t in traj], axis=1), axis=1)
@@ -475,4 +614,4 @@ class GaussianDiffusion(BaseModel):
         else:
             samples = traj[-1][0]
 
-        return samples
+        return samples, traj
