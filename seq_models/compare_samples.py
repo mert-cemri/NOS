@@ -214,6 +214,7 @@ def label_csv(
         f"{basename}_labeled.csv",
     )
     df.to_csv(labeled_fn, index=False)
+    print(labeled_fn)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Add input file path")
