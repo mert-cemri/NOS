@@ -82,6 +82,7 @@ def sample_model(
     use_alignment_tokens=True,
     bad_word_ids=None,
     autoregressive_sample=False,
+    dps_enable = False,
 ):
     log, wandb_log = {}, {}
 
@@ -96,7 +97,10 @@ def sample_model(
         vocab_file=vocab_file, 
         do_lower_case=False,
     )
-
+    # print(infill_seeds)
+    # print(len(infill_seeds))
+    # print(infill_seed_file)
+    # assert False
     for i, infill_seed in enumerate(infill_seeds):
         
         tag = "" if guidance_kwargs is None else "guided_"
@@ -110,7 +114,7 @@ def sample_model(
 
         if not use_alignment_tokens:
             infill_seed = infill_seed.replace("- ","")
-        print(infill_seed)
+        #print("Infill seed:",infill_seed)
 
         infill_seed = torch.Tensor(
             tokenizer.convert_tokens_to_ids(infill_seed.split(" "))
@@ -136,17 +140,25 @@ def sample_model(
         if guidance_kwargs is not None:
             model.network.regression_head.stop_grad = False
 
+        # print(guidance_kwargs)
+        # assert False
         with torch.no_grad():
-            samples = sample_fn(
+            samples, traj = sample_fn(
                 infill_seed=infill_seed,
                 infill_mask=infill_mask,
                 corrupt_mask=corrupt_mask,
                 num_samples=num_samples,
                 guidance_kwargs=copy.deepcopy(guidance_kwargs),
                 bad_word_ids=bad_word_ids,
+                vocab_file=vocab_file,
+                dps_enable = dps_enable,
                 # batch_size=256
             )
+        #print(samples)
+        #print("Samples original length:",len(samples))
         samples = [tokenizer.decode(s) for s in samples]
+        #print("decoded samples:",samples)
+        #print("Length of samples:",len(samples))
 
         seed_log, seed_wandb_log = metrics.evaluate_samples(
             samples,
@@ -343,7 +355,8 @@ def sample_outer_loop(
 
     import random
     random.shuffle(sampling_kwargs_list)
-
+    # print(len(sampling_kwargs_list))
+    # assert False
     dfs = []
     for sampling_kwargs in sampling_kwargs_list:
         kwargs_tag = "_".join(
@@ -365,22 +378,25 @@ def sample_outer_loop(
             print(f"Skipping {full_tag}")
             continue
 
-        try:
-            dfs.append(
-                sample_inner_loop(
-                    csv_fn,
-                    results_dir,
-                    model,
-                    full_tag,
-                    vocab_file,
-                    num_samples=10,
-                    sampling_kwargs=sampling_kwargs,
-                )
+        # try:
+        dfs.append(
+            sample_inner_loop(
+                csv_fn,
+                results_dir,
+                model,
+                full_tag,
+                vocab_file,
+                num_samples=10,
+                sampling_kwargs=sampling_kwargs,
             )
-        except Exception as e:
-            print(e)
-            print(f"Failed to sample for {full_tag}")
+        )
+        # except Exception as e:
+        #     print(e)
+        #     print(f"Failed to sample for {full_tag}")
 
+    # print("These are dataframes")
+    # print(dfs)
+    # assert False
     df = pd.concat(dfs)
     df.to_csv(
         os.path.join(
