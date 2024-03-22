@@ -399,20 +399,20 @@ class DiscreteCorruptionSchedule:
         return corrupt_ids
 
     def corrupt(self, input_ids, timesteps, corrupt_mask=None):
-        mask_nums = torch.rand_like(input_ids, dtype=torch.float32)
-        mask = torch.zeros_like(mask_nums, dtype=torch.bool)
-        for i, t in enumerate(timesteps):
-            mask[i] = mask_nums[i] < self.mask_rates[t]
+        mask_nums = torch.rand_like(input_ids, dtype=torch.float32) # size B x L
+        mask = torch.zeros_like(mask_nums, dtype=torch.bool) # size B x L
+        for i, t in enumerate(timesteps): 
+            mask[i] = mask_nums[i] < self.mask_rates[t] # size L
         
         if corrupt_mask is not None:
             mask = (mask * corrupt_mask).bool()
 
-        noise_token_ids = self.noise_token_ids.to(input_ids.device)
+        noise_token_ids = self.noise_token_ids.to(input_ids.device) # this is just the [MASK] token id
 
         new_ids = copy.deepcopy(input_ids)
         for i, t in enumerate(timesteps):
             noise_id_idxs = torch.randint_like(input_ids[i], 0, len(self.noise_token_ids))
             corrupt_ids = torch.take_along_dim(noise_token_ids, noise_id_idxs.long(), dim=0)
-            new_ids[i] = torch.where(mask[i], corrupt_ids, new_ids[i])
+            new_ids[i] = torch.where(mask[i], corrupt_ids, new_ids[i]) # size L
 
         return new_ids, mask
