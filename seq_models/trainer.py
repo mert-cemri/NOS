@@ -99,13 +99,13 @@ class SampleEvaluationCallback(Callback):
 
         _, log = sample_model(
             pl_module,
-            self.num_samples,
-            self.infill_seed_file,
-            self.vocab_file,
-            self.gt_data_file,
-            self.guidance_kwargs,
-            self.use_alignment_tokens,
-            self.autoregressive_sample,
+            num_samples = self.num_samples,
+            infill_seed_file = self.infill_seed_file,
+            vocab_file = self.vocab_file,
+            gt_data_file = self.gt_data_file,
+            guidance_kwargs = self.guidance_kwargs,
+            use_alignment_tokens = self.use_alignment_tokens,
+            autoregressive_sample = self.autoregressive_sample,
         )
 
         wandb.log(log)
@@ -139,7 +139,8 @@ def get_trainer(config, num_train_batches):
     accelerator, strategy = "cpu", None
     if torch.cuda.is_available():
         accelerator = "gpu"
-        strategy = "ddp"
+        #strategy = "ddp"
+        strategy= "ddp_find_unused_parameters_true"
         # if torch.cuda.device_count() > 1:
         #     strategy = DDPStrategy(find_unused_parameters=False)
 
