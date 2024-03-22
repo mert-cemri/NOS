@@ -22,7 +22,7 @@ from transformers.models.bert.modeling_bert import (
     BertEmbeddings,
     BertOnlyMLMHead,
 )
-
+import transformers
 from seq_models.trainer import BaseModel
 from seq_models.nets.regression import (
     RegressionHead,
@@ -39,6 +39,7 @@ class MLMDiffusionTransformer(nn.Module):
         bert_config_name='bert-base-uncased',
         target_channels=2,
         discr_stop_grad=True,
+        vocab_file=None
     ):
         super().__init__()
 
@@ -55,7 +56,12 @@ class MLMDiffusionTransformer(nn.Module):
         self.encoder = BertEncoder(config)
         self.cls = BertOnlyMLMHead(config)
 
+        self.tokenizer = transformers.BertTokenizerFast(
+                            vocab_file=vocab_file, 
+                            do_lower_case=False,
+                        )
         # self.cls.predictions.decoder.weight = self.embeddings.word_embeddings.weight
+        #samples = [tokenizer.decode(s) for s in samples]
 
         self.time_embed_dim = config.hidden_size
         self.time_embed = nn.Sequential(
@@ -85,10 +91,10 @@ class MLMDiffusionTransformer(nn.Module):
 
         time_embed = self.time_embed(timestep_embedding(timesteps, self.time_embed_dim))
         time_embed = time_embed.unsqueeze(1).expand(-1, token_embed.size(1), -1)
-        embed = self.dropout(self.LayerNorm(token_embed + time_embed))
+        embed = self.dropout(self.LayerNorm(token_embed + time_embed)) #encodings at the first layer
 
-        sequence_output = self.encoder(embed, encoder_attention_mask=attn_mask)[0]
-        prediction_scores = self.cls(sequence_output)
+        sequence_output = self.encoder(embed, encoder_attention_mask=attn_mask)[0] #enocodings at the last layer
+        prediction_scores = self.cls(sequence_output) #dist over vocab for masked indices
 
         out = {
             "logits": prediction_scores,
@@ -118,9 +124,8 @@ class MLMDiffusionTransformer(nn.Module):
     ):
         labels = self.get_labels(input_ids, timesteps, attn_mask, sequence_output)
         return labels.sum(-1) 
-
-
-class MLMDiffusion(BaseModel):
+    
+class MLMDiffusion_DPS(BaseModel):
 
     def __init__(
         self,
@@ -219,7 +224,7 @@ class MLMDiffusion(BaseModel):
         return out
 
 
-    def guidance_steps(
+    def dps_guidance_steps(
         self,
         model_output,
         t,
@@ -229,38 +234,60 @@ class MLMDiffusion(BaseModel):
         step_size=0.1,
         stability_coef=1e-2,
         num_steps=5,
+        return_best = False
     ):
         kl_loss = torch.nn.KLDivLoss(log_target=True)
 
-        logits = model_output['logits']
+        logits = model_output['logits'] ## this is p_(w-hat|w_t)
         if guidance_layer == "last":
-            h = model_output['sequence_output']
+            h = model_output['sequence_output'] ## this is h=T(w_t)
         elif guidance_layer == "first":
-            h = model_output['embeds']
+            h = model_output['embeds'] ## this is h=T(w_t)
         else:
             raise NotImplementedError()
+        # print(model_output)
+        # print("embeds",model_output['embeds'].shape) #10,300,512
+        # print("sequence_output",model_output['sequence_output'].shape) #10,300,512
+        # print("logits",model_output['logits'].shape) #10,300,30
+        # assert False
         
-        delta = torch.nn.Parameter(torch.zeros_like(h), requires_grad=True)
+        delta = torch.nn.Parameter(torch.zeros_like(h), requires_grad=True) #this the learnable parameter, learn this to modify h
         optimizer = torch.optim.Adagrad([delta], lr=step_size)
         
+        target_losses = []
         with torch.enable_grad():
             for _ in range(num_steps):
                 h_current = h + infill_mask.unsqueeze(-1) * delta
 
+                # wt = decode(h_current)
+                # for i in range(t):
+                #     w_t_1 = self.network(wt, t, attn_mask)
+                #     wt = w_t_1
+                # h_t = self.network(wt,t,attn_mask)["embeds"]
+                
+                
                 if guidance_layer == "last":
                     target_loss = self.network.guidance_score(
                         None, t, attn_mask, sequence_output=h_current
                     ).sum()
                     new_logits = self.network.cls(h_current)
+
                 elif guidance_layer == "first":
                     out = self.network.forward(
                         None, t, attn_mask, token_embed=h_current
                     )
-                    target_loss = self.network.guidance_score(
-                        None, t, attn_mask, sequence_output=out['sequence_output']
-                    ).sum()
                     new_logits = out['logits']
-
+                    # w_hat = Categorical(logits=new_logits).sample()
+                    w_hat = F.gumbel_softmax(new_logits, tau=1, hard=True)@torch.arange(new_logits.shape[2]).float().to(new_logits.device)
+                    # print(w_hat.shape)
+                    # print(Categorical(logits=new_logits).sample().shape)
+                    # print(Categorical(logits=new_logits).sample()[0])
+                    # assert False
+                    target_loss = self.network.guidance_score(
+                        None, t, attn_mask, sequence_output=self.network.forward(w_hat.long(),t,attn_mask)["sequence_output"]
+                    ).sum()
+                    
+                target_losses.append(target_loss.detach().cpu().numpy())
                 kl = kl_loss(new_logits, logits)
                 loss = -target_loss + stability_coef * kl
                 
@@ -287,8 +314,8 @@ class MLMDiffusion(BaseModel):
             
             # print("\n")
 
-        logits = self.network.cls(h + delta.data)
-        return logits
+        logits = self.network.cls(h + delta.data) #this is H_theta(h)
+        return logits,target_losses
 
 
     def sample(
@@ -299,6 +326,444 @@ class MLMDiffusion(BaseModel):
         num_samples,
         guidance_kwargs=None,
         bad_word_ids=None,
+        vocab_file=None,
+        return_best=False,
+        dps_enable=False
+    ):
+        device = next(self.parameters()).device
+        infill_mask = infill_mask[None,:]
+        corrupt_mask = corrupt_mask[None,:]
+        gt_vals = infill_seed[None]
+
+        indices = list(range(self.noise_schedule.timesteps))[::-1]
+
+        t = torch.tensor([indices[0]], device=device)
+        noisy_gt = self.noise_schedule.corrupt(gt_vals, t)[0]
+        noisy_gt = torch.where(corrupt_mask, noisy_gt, gt_vals)
+        
+        shape = (num_samples, infill_seed.shape[0])
+        x = self.noise_schedule.sample_prior(shape, device)
+        x = torch.where(infill_mask, x, noisy_gt)
+        attn_mask = torch.ones_like(infill_mask, dtype=torch.bool)
+
+        traj = []
+        all_target_losses = []
+        for i in tqdm.tqdm(indices):
+            t = torch.tensor([i] * shape[0], device=device)
+
+            with torch.no_grad():
+                model_output = self.network(x, t, attn_mask)
+            
+            logits = model_output["logits"] #logits are probs of MLM, i.e. p_theta(w-hat|w_t)
+            
+            if guidance_kwargs is not None:
+                logits,target_losses = self.guidance_steps(
+                    model_output, t, attn_mask, infill_mask, 
+                    **guidance_kwargs
+                )
+                all_target_losses += target_losses
+                #np.save("/home/cemri/NOS/scratch/target_losses_dps-3.npy", np.array(all_target_losses))
+
+            if bad_word_ids is not None:
+                logits[:, :, bad_word_ids] = -1e9
+                
+            if logits.shape[2] == 30:    
+                logits[:,:,29] = -1e9
+
+            x = Categorical(logits=logits).sample() # here we got (sampled) w-hat
+            clean_x = x.clone() ## clean_x's are w_{t-1}'s
+
+            if i != indices[-1]:
+                x = self.noise_schedule.corrupt(x, t, infill_mask)[0] # these are x_{t-1} sampled from p(x_t-1|x_t,w-hat)
+
+                noise_t = torch.tensor([i-1] * shape[0], device=device)
+                noisy_gt = self.noise_schedule.corrupt(gt_vals, noise_t[:1])[0]
+                noisy_gt = torch.where(corrupt_mask.bool(), noisy_gt, gt_vals) #TODO: clean up these are s_t's
+                x = torch.where(infill_mask, x, noisy_gt) ## these are x_{t-1}'s (or terminal h's)
+
+            pred_ids = torch.where(infill_mask.squeeze(-1), clean_x, infill_seed[None]) ### pred_ids[0]'s are w_{t-1}'s
+
+            if guidance_kwargs is not None:
+                labels = self.network.guidance_score(pred_ids, t, attn_mask).cpu().numpy()
+                pred_ids = (pred_ids.cpu().numpy(), labels)
+            else:
+                pred_ids = pred_ids.cpu().numpy()
+
+            traj.append(pred_ids)
+
+        if return_best:
+            best_idx = np.argmax(np.stack([t[1] for t in traj], axis=1), axis=1)
+            samples = np.stack([
+                traj[idx][0][i] for i, idx in enumerate(best_idx)
+            ], axis=0)
+        else:
+            samples = traj[-1][0]
+
+        return samples, traj
+    
+    def guidance_steps(
+        self,
+        model_output,
+        t,
+        attn_mask,
+        infill_mask,
+        guidance_layer="first",
+        step_size=0.1,
+        stability_coef=1e-2,
+        num_steps=5,
+        return_best=False,
+    ):
+        kl_loss = torch.nn.KLDivLoss(log_target=True)
+
+        logits = model_output['logits']
+        if guidance_layer == "last":
+            h = model_output['sequence_output']
+        elif guidance_layer == "first":
+            h = model_output['embeds']
+        else:
+            raise NotImplementedError()
+        
+        delta = torch.nn.Parameter(torch.zeros_like(h), requires_grad=True)
+        optimizer = torch.optim.Adagrad([delta], lr=step_size)
+        
+        # print("we are here")
+        # assert False
+        target_losses = []
+        with torch.enable_grad():
+            for _ in range(num_steps):
+                h_current = h + infill_mask.unsqueeze(-1) * delta
+
+                if guidance_layer == "last":
+                    target_loss = self.network.guidance_score(
+                        None, t, attn_mask, sequence_output=h_current
+                    ).sum()
+                    new_logits = self.network.cls(h_current)
+                elif guidance_layer == "first":
+                    out = self.network.forward(
+                        None, t, attn_mask, token_embed=h_current
+                    )
+                    target_loss = self.network.guidance_score(
+                        None, t, attn_mask, sequence_output=out['sequence_output']
+                    ).sum()
+                    new_logits = out['logits']
+
+                kl = kl_loss(new_logits, logits)
+                loss = -target_loss + stability_coef * kl
+                target_losses.append(target_loss.detach().cpu().numpy())
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                
+                # delta_grad_norm = delta.grad.norm(dim=(2), keepdim=True)
+                # delta.grad /= delta_grad_norm.clamp_min(1e-7)
+                # if i < 100:
+                #     print(target_loss)
+                #     print(sample_loss)
+                #     print(delta.pow(2).mean())
+                #     print("")
+
+                # eps = torch.randn_like(feature_grad) / grad_norm.clamp_min(1e-7)
+                # new_features.add_(
+                #     eps, alpha=math.sqrt(2 * guidance_step_size * langevin_noise_scale)
+                # )
+                
+                # print(target_loss.item(), kl.item())
+
+                # store best seqs?
+            
+            # print("\n")
+
+        logits = self.network.cls(h + delta.data)
+        return logits,target_losses
+    
+    def sample_autoregressive(
+        self,
+        infill_seed,
+        infill_mask,
+        corrupt_mask,
+        num_samples,
+        guidance_kwargs=None,
+        bad_word_ids=None,
+    ):
+        device = next(self.parameters()).device
+        
+        infill_mask = infill_mask[None,:]
+        corrupt_mask = corrupt_mask[None,:]
+        gt_vals = infill_seed[None]
+ 
+        unmasked_indices = torch.nonzero(infill_mask[0])[:,0].cpu().numpy()
+        num_autoregessive_steps = len(unmasked_indices)
+
+        shape = (num_samples, infill_seed.shape[0])
+
+        T = self.noise_schedule.timesteps - 1
+        T = torch.tensor([T] * shape[0], device=device)
+
+        noisy_gt = self.noise_schedule.corrupt(gt_vals, T[:1])[0]
+        noisy_gt = torch.where(corrupt_mask, noisy_gt, gt_vals)
+        
+        x = self.noise_schedule.sample_prior(shape, device)
+        x = torch.where(infill_mask, x, noisy_gt)
+        attn_mask = torch.ones_like(infill_mask, dtype=torch.bool)
+
+        # tokenizer = transformers.BertTokenizerFast(
+        #     vocab_file="/home/nvg7279/src/seq-struct/vocab.txt", 
+        #     do_lower_case=False,
+        # )
+
+        return_best = guidance_kwargs.pop("return_best", False) \
+            if guidance_kwargs is not None else False
+
+        traj = []
+        all_target_losses = []
+        for i, idx in tqdm.tqdm(enumerate(unmasked_indices), total=len(unmasked_indices)):
+
+            perc = float(i) / num_autoregessive_steps
+            timestep = np.argmin(np.abs(self.noise_schedule.mask_rates - perc))
+            t = torch.tensor([timestep] * shape[0], device=device)
+
+            with torch.no_grad():
+                model_output = self.network(x, t, attn_mask)
+            
+            logits = model_output["logits"]
+            
+            if guidance_kwargs is not None:
+                logits, target_losses = self.guidance_steps(
+                    model_output, t, attn_mask, infill_mask, 
+                    **guidance_kwargs
+                )
+                all_target_losses += target_losses
+                np.save("/home/cemri/NOS/scratch/all_target_losses_dps.npy", np.array(all_target_losses))
+    
+            if bad_word_ids is not None:
+                logits[:, :, bad_word_ids] = -1e9
+
+            if logits.shape[2] == 30:    
+                logits[:,:,29] = -1e9
+
+            autoregressive_mask = torch.clone(infill_mask)
+            autoregressive_mask[:,:idx] = 0
+
+            sample_x = Categorical(logits=logits).sample()
+            x = torch.where(autoregressive_mask, sample_x, x) #don't resample AR
+            clean_x = x.clone()
+
+            if i != len(unmasked_indices) - 1:
+                autoregressive_mask[:,:idx+1] = 0
+                x = self.noise_schedule.corrupt(x, T, autoregressive_mask)[0]
+
+                noise_t = torch.tensor([timestep-1] * shape[0], device=device)
+                noise_t = torch.maximum(noise_t, torch.zeros_like(noise_t))
+
+                noisy_gt = self.noise_schedule.corrupt(gt_vals, noise_t[:1])[0]
+                noisy_gt = torch.where(corrupt_mask.bool(), noisy_gt, gt_vals) #TODO: clean up
+                x = torch.where(infill_mask, x, noisy_gt)
+                
+            pred_ids = torch.where(infill_mask.squeeze(-1), clean_x, infill_seed[None])
+
+            if guidance_kwargs is not None:
+                labels = self.network.guidance_score(pred_ids, t, attn_mask).cpu().numpy()
+                pred_ids = (pred_ids.cpu().numpy(), labels)
+            else:
+                pred_ids = pred_ids.cpu().numpy()
+
+            traj.append(pred_ids)
+
+        if return_best:
+            best_idx = np.argmax(np.stack([t[1] for t in traj], axis=1), axis=1)
+            samples = np.stack([
+                traj[idx][0][i] for i, idx in enumerate(best_idx)
+            ], axis=0)
+        else:
+            samples = traj[-1][0]
+
+        return samples, traj
+
+class MLMDiffusion(BaseModel):
+
+    def __init__(
+        self,
+        network,
+        noise_schedule,
+        optimizer,
+        lr_scheduler,
+    ):
+        super().__init__()
+
+        self.network = hydra.utils.instantiate(network)
+        self.noise_schedule = hydra.utils.instantiate(noise_schedule)
+        self.opt = hydra.utils.instantiate(optimizer, params=self.parameters())
+        self.lr_scheduler = None
+        if lr_scheduler:
+            self.lr_scheduler = hydra.utils.instantiate(lr_scheduler, self.opt)
+
+    def freeze_for_discriminative(self):
+        for _, p in enumerate(self.network.parameters()):
+            p.requires_grad_(False)
+
+        for _, p in enumerate(self.network.regression_head.parameters()):
+            p.requires_grad_(True)
+
+    def forward(
+        self,
+        input_ids,
+        corrupt_mask,
+        attn_mask,
+        labels=None,
+        return_by_timestep=False,
+    ):
+        timesteps = self.noise_schedule.timesteps
+        t = torch.randint(
+            timesteps, 
+            size=(input_ids.shape[0],),
+            device=input_ids.device,
+            dtype=torch.int64,
+        )
+
+        corrupt_ids, corrupt_mask = (
+            self.noise_schedule.corrupt(input_ids, t, corrupt_mask)
+        )
+
+        model_output = self.network(
+            corrupt_ids,
+            t, 
+            attn_mask,
+        )
+        logits = model_output['logits']
+        hiddens = model_output['sequence_output']
+        
+        loss_fct = nn.CrossEntropyLoss(reduction='none')  # -100 index = padding token
+        nll = loss_fct(logits.view(-1, logits.shape[-1]), input_ids.view(-1))
+        nll = nll.view(*input_ids.shape[:2])
+
+        loss_mask = attn_mask * corrupt_mask
+
+        denom = loss_mask.sum(dim=-1)
+        denom[denom == 0] = 1
+
+        nll = (nll * loss_mask).sum(dim=-1) / denom
+        accuracy = ((logits.argmax(-1) == input_ids) * loss_mask).sum(dim=-1) / denom
+        loss = nll.mean()
+
+        out = {}
+        out["loss"] = loss.mean()
+        out["nll"] = nll.mean()
+        out["accuracy"] = accuracy.mean()
+        #print(labels.shape) # torch.Size([64, 1]
+        if labels is not None:
+            pred_labels = self.network.regression_head(hiddens.detach())
+            regression_loss = (pred_labels - labels).pow(2)
+            out["regression_mse"] = regression_loss.mean()
+            out["regression_spearman"] = spearmanr(
+                pred_labels[:,0].detach().cpu().numpy(),  
+                labels[:,0].detach().cpu().numpy(),
+            ).correlation
+
+        if not return_by_timestep:
+            return out
+        
+        num_buckets = 4
+        step_size = timesteps // num_buckets
+        for t_lower in np.arange(0, timesteps, step_size):
+            t_upper = t_lower + step_size
+            t_mask = (t > t_lower) * (t < t_upper)
+            
+            tag = f"accuracy_{t_lower}-{t_upper}"
+            out[tag] = accuracy[t_mask].mean()
+            
+            if labels is not None:
+                tag = f"regression_mse_{t_lower}-{t_upper}"
+                out[tag] = regression_loss[t_mask].mean()
+
+        return out
+
+
+    def guidance_steps(
+        self,
+        model_output,
+        t,
+        attn_mask,
+        infill_mask,
+        guidance_layer="first",
+        step_size=0.1,
+        stability_coef=1e-2,
+        num_steps=5,
+        return_best=False,
+    ):
+        kl_loss = torch.nn.KLDivLoss(log_target=True)
+
+        logits = model_output['logits']
+        if guidance_layer == "last":
+            h = model_output['sequence_output']
+        elif guidance_layer == "first":
+            h = model_output['embeds']
+        else:
+            raise NotImplementedError()
+        
+        delta = torch.nn.Parameter(torch.zeros_like(h), requires_grad=True)
+        optimizer = torch.optim.Adagrad([delta], lr=step_size)
+        
+        # print("we are here")
+        # assert False
+        target_losses = []
+        with torch.enable_grad():
+            for _ in range(num_steps):
+                h_current = h + infill_mask.unsqueeze(-1) * delta
+
+                if guidance_layer == "last":
+                    target_loss = self.network.guidance_score(
+                        None, t, attn_mask, sequence_output=h_current
+                    ).sum()
+                    new_logits = self.network.cls(h_current)
+                elif guidance_layer == "first":
+                    out = self.network.forward(
+                        None, t, attn_mask, token_embed=h_current
+                    )
+                    target_loss = self.network.guidance_score(
+                        None, t, attn_mask, sequence_output=out['sequence_output']
+                    ).sum()
+                    new_logits = out['logits']
+
+                kl = kl_loss(new_logits, logits)
+                loss = -target_loss + stability_coef * kl
+                target_losses.append(target_loss.detach().cpu().numpy())
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                
+                # delta_grad_norm = delta.grad.norm(dim=(2), keepdim=True)
+                # delta.grad /= delta_grad_norm.clamp_min(1e-7)
+                # if i < 100:
+                #     print(target_loss)
+                #     print(sample_loss)
+                #     print(delta.pow(2).mean())
+                #     print("")
+
+                # eps = torch.randn_like(feature_grad) / grad_norm.clamp_min(1e-7)
+                # new_features.add_(
+                #     eps, alpha=math.sqrt(2 * guidance_step_size * langevin_noise_scale)
+                # )
+                
+                # print(target_loss.item(), kl.item())
+
+                # store best seqs?
+            
+            # print("\n")
+
+        logits = self.network.cls(h + delta.data)
+        return logits,target_losses
+
+
+    def sample(
+        self,
+        infill_seed,
+        infill_mask,
+        corrupt_mask,
+        num_samples,
+        guidance_kwargs=None,
+        bad_word_ids=None,
+        vocab_file = None,
+        dps_enable=False
     ):
         device = next(self.parameters()).device
         
@@ -317,10 +782,12 @@ class MLMDiffusion(BaseModel):
         x = torch.where(infill_mask, x, noisy_gt)
         attn_mask = torch.ones_like(infill_mask, dtype=torch.bool)
 
-        return_best = guidance_kwargs.pop("return_best", False) \
-            if guidance_kwargs is not None else False
+        # return_best = guidance_kwargs.pop("return_best", False) \
+        #     if guidance_kwargs is not None else False
+        return_best = False
 
         traj = []
+        all_target_losses = []
         for i in tqdm.tqdm(indices):
             t = torch.tensor([i] * shape[0], device=device)
 
@@ -330,10 +797,13 @@ class MLMDiffusion(BaseModel):
             logits = model_output["logits"]
             
             if guidance_kwargs is not None:
-                logits = self.guidance_steps(
+                logits,target_losses = self.guidance_steps(
                     model_output, t, attn_mask, infill_mask, 
                     **guidance_kwargs
                 )
+            
+                all_target_losses += target_losses
+                np.save("/home/cemri/NOS/scratch/target_losses_vanilla.npy",np.array(all_target_losses))
 
             if bad_word_ids is not None:
                 logits[:, :, bad_word_ids] = -1e9
@@ -370,7 +840,7 @@ class MLMDiffusion(BaseModel):
         else:
             samples = traj[-1][0]
 
-        return samples
+        return samples, traj
     
     def sample_autoregressive(
         self,
@@ -470,4 +940,4 @@ class MLMDiffusion(BaseModel):
         else:
             samples = traj[-1][0]
 
-        return samples
+        return samples, traj
