@@ -10,7 +10,7 @@ train_fn: train.csv
 val_fn: val_iid.csv
 max_samples: 100000
 
-target_cols: ['sasa'] #['ss_perc_sheet']
+target_cols: ['ss_perc_sheet']
 discr_epoch_ratio: null
 
 vocab_file: /home/nvg7279/src/seq-struct/vocab.txt
@@ -21,7 +21,8 @@ log_dir: /scratch/nvg7279/logs/guided_protein_seq
 exp_name: train_disrc_test
 exp_dir: ${log_dir}/${exp_name}
 
-ckpt_path: /scratch/nvg7279/logs/guided_protein_seq/ar_mlm_test/models/best_by_valid/epoch=74-step=53700.ckpt
+#ckpt_path: /scratch/nvg7279/logs/guided_protein_seq/ar_mlm_test/models/best_by_valid/epoch=74-step=53700.ckpt
+ckpt_path: None
 train_w_noise: True
 
 max_seq_len: 300
