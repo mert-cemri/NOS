@@ -1,5 +1,7 @@
 # @package _global_
 model:
+  #_target_: seq_models.model.mlm_diffusion.MLMDiffusion_DPS
+
   _target_: seq_models.model.mlm_diffusion.MLMDiffusion
 
   network:
@@ -9,6 +11,7 @@ model:
     bert_config_name: "prajjwal1/bert-small"
     discr_stop_grad: True
     target_channels: 0
+    vocab_file: ${vocab_file}
 
   noise_schedule:
     _target_: seq_models.schedule.noise_schedule.DiscreteCorruptionSchedule
@@ -19,7 +22,7 @@ model:
 
   optimizer:
     _target_: torch.optim.AdamW
-    lr: 5e-4
+    lr: 5e-3
 
   lr_scheduler:
     _target_:  transformers.get_linear_schedule_with_warmup
