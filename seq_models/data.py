@@ -118,6 +118,10 @@ class LabeledDataset(Dataset):
                 pickle.dump(self.inputs, source)
 
         if config.target_cols is not None:
+            # print(df.columns)
+            # print('sasa' in list(df.columns))
+            # print(config.target_cols)
+            # assert False
             label_values = StandardScaler().fit_transform(df[config.target_cols])
             
             self.inputs = [
