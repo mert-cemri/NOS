@@ -13,7 +13,7 @@ def main(input_dir, structure_labels=False):
             os.path.dirname(input_fn), 
             f"{os.path.basename(input_fn).split('.')[0]}_labeled.csv",
         )
-
+        print(results_fn)
         if os.path.exists(results_fn):
             print(f"Skipping {input_fn}")
             continue
