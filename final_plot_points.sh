@@ -7,6 +7,7 @@ do
     stability_coef_str=$(printf "%.5f" $stability_coef)
 
     PYTHONPATH="." python scripts/sample.py \
+    infill_seeds_fn='/data/cemri/NOS/infill_test_seeds.txt' \
     model._target_=seq_models.model.mlm_diffusion.MLMDiffusion_DPS \
     dps_enable=True \
     model=mlm \
