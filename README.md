@@ -3,7 +3,7 @@
 ```
 PYTHONPATH="." python scripts/train_seq_model.py \
   model=mlm \
-  infill_seeds_fn='/data/cemri/NOS/infill_test_seeds.txt' \ ##when doing infilling experiments
+  infill_seeds_fn='/data/cemri/NOS/infill_test_seeds.txt' \ ## when doing infilling experiments
   model._target_=seq_models.model.mlm_diffusion.MLMDiffusion \
   model.optimizer.lr=0.005 \
   data_dir=/data/cemri/NOS/data \
@@ -23,7 +23,7 @@ PYTHONPATH="." python scripts/train_seq_model.py \
 ```
 PYTHONPATH="." python scripts/train_seq_model.py \
   model=mlm \
-  infill_seeds_fn='/data/cemri/NOS/infill_test_seeds.txt' \
+  infill_seeds_fn='/data/cemri/NOS/infill_test_seeds.txt' \ ## when doing infilling experiments
   model._target_=seq_models.model.mlm_diffusion.MLMDiffusion_DPS \
   model.optimizer.lr=0.005 \
   data_dir=/data/cemri/NOS/data \
