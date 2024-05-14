@@ -83,6 +83,7 @@ def sample_model(
     bad_word_ids=None,
     autoregressive_sample=False,
     dps_enable = False,
+    return_sequences = False
 ):
     log, wandb_log = {}, {}
 
@@ -97,9 +98,9 @@ def sample_model(
         vocab_file=vocab_file, 
         do_lower_case=False,
     )
-    # print(infill_seeds)
+    # print("Infill seeds:",infill_seeds)
     # print(len(infill_seeds))
-    # print(infill_seed_file)
+    # print("Infill seeds file:",infill_seed_file)
     # assert False
     for i, infill_seed in enumerate(infill_seeds):
         
@@ -142,6 +143,38 @@ def sample_model(
 
         # print(guidance_kwargs)
         # assert False
+        # print('=========================')
+        # print('infill_seed:',infill_seed)
+        # print('infill_mask:',infill_mask)
+        # print('corrupt_mask:',corrupt_mask)
+        # print('num_samples',num_samples)
+        # print('vocab_file',vocab_file)
+        # print('=========================')
+
+        import esm
+        import pandas as pd
+        def get_map(seqs, esm_model, esm_alphabet):
+            batch_converter = esm_alphabet.get_batch_converter()
+            data = [ (f"protein{i}", seqs[i].replace('[AbHC]','').replace('[AbLC]','').replace('[Ag]','').replace('-','').replace(' ','')) for i in range(2)]
+            batch_labels, batch_strs, batch_tokens = batch_converter(data)
+            batch_lens = (batch_tokens != esm_alphabet.padding_idx).sum(1)
+            with torch.no_grad():
+                results = esm_model(batch_tokens, repr_layers=[33], return_contacts=True)
+            token_representations = results["representations"][33]
+            contact_maps = []
+            for (_, seq), tokens_len, attention_contacts in zip(data, batch_lens, results["contacts"]):
+                contact_maps.append(attention_contacts[: tokens_len, : tokens_len])
+            return contact_maps
+        esm_model, esm_alphabet = esm.pretrained.esm2_t33_650M_UR50D()
+        val_path = "/data/cemri/NOS/data/val_iid.csv"
+        val_df = pd.read_csv(val_path)
+        val_contact_maps = get_map(val_df['seq'], esm_model, esm_alphabet)
+
+        bad_word_ids = tokenizer.convert_tokens_to_ids(
+        SPECIAL_TOKENS + ['[PAD]', '[UNK]', '[CLS]', '[SEP]', '[MASK]']
+        )
+        bad_word_ids += tokenizer.convert_tokens_to_ids(['-'])
+
         with torch.no_grad():
             samples, traj = sample_fn(
                 infill_seed=infill_seed,
@@ -152,13 +185,14 @@ def sample_model(
                 bad_word_ids=bad_word_ids,
                 vocab_file=vocab_file,
                 dps_enable = dps_enable,
+                val_contact_maps = val_contact_maps,
                 # batch_size=256
             )
-        #print(samples)
-        #print("Samples original length:",len(samples))
+        # print(samples)
+        # print("Samples original length:",len(samples))
         samples = [tokenizer.decode(s) for s in samples]
-        #print("decoded samples:",samples)
-        #print("Length of samples:",len(samples))
+        # print("decoded samples:",samples)
+        # print("Length of samples:",len(samples))
 
         seed_log, seed_wandb_log = metrics.evaluate_samples(
             samples,
@@ -170,6 +204,9 @@ def sample_model(
                 
         log.update(seed_log)
         wandb_log.update(seed_wandb_log)
+        # assert False
+    if return_sequences:
+        return log, wandb_log, samples
 
     return log, wandb_log
 
