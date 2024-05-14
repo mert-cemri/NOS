@@ -1,4 +1,4 @@
-# commands to test:
+## commands to test:
 for vanilla NOS model 
 ```
 ./final_plot_points.sh
@@ -8,8 +8,8 @@ for OUR model
 ./final_plot_points_dps.sh
 ```
 
-# commands to train:
-## for vanilla NOS model 
+## commands to train:
+for vanilla NOS model 
 ```
 PYTHONPATH="." python scripts/train_seq_model.py \
   model=mlm \
@@ -29,7 +29,7 @@ PYTHONPATH="." python scripts/train_seq_model.py \
   batch_size=64 \
   dps_enable=False
 ```
-## for OUR model 
+for OUR model 
 ```
 PYTHONPATH="." python scripts/train_seq_model.py \
   model=mlm \
