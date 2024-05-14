@@ -1,3 +1,13 @@
+# commands to test:
+for vanilla NOS model 
+```
+./final_plot_points.sh
+```
+for OUR model 
+```
+./final_plot_points_dps.sh
+```
+
 # commands to train:
 ## for vanilla NOS model 
 ```
