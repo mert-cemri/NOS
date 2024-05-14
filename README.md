@@ -1,5 +1,6 @@
 # commands to train:
 ## for vanilla NOS model 
+```
 PYTHONPATH="." python scripts/train_seq_model.py \
   model=mlm \
   infill_seeds_fn='/data/cemri/NOS/infill_test_seeds.txt' \ ##when doing infilling experiments
@@ -17,8 +18,9 @@ PYTHONPATH="." python scripts/train_seq_model.py \
   min_epochs=0 \
   batch_size=64 \
   dps_enable=False
-
+```
 ## for OUR model 
+```
 PYTHONPATH="." python scripts/train_seq_model.py \
   model=mlm \
   infill_seeds_fn='/data/cemri/NOS/infill_test_seeds.txt' \
@@ -36,7 +38,7 @@ PYTHONPATH="." python scripts/train_seq_model.py \
   min_epochs=0 \
   batch_size=64 \
   dps_enable=True
-  
+``` 
 
 
 <div>
