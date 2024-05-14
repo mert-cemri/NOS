@@ -1,3 +1,44 @@
+## commands to train:
+# for vanilla NOS model 
+PYTHONPATH="." python scripts/train_seq_model.py \
+  model=mlm \
+  infill_seeds_fn='/data/cemri/NOS/infill_test_seeds.txt' \ ##when doing infilling experiments
+  model._target_=seq_models.model.mlm_diffusion.MLMDiffusion \
+  model.optimizer.lr=0.005 \
+  data_dir=/data/cemri/NOS/data \
+  train_fn=train.csv \
+  val_fn=val_iid.csv \
+  vocab_file=/data/cemri/NOS/vocab.txt \
+  log_dir="/data/cemri/NOS/scratch/logs/guided_infill_protein_mlm_ss_perc_sheet_vanilla_5_ffs" \
+  'target_cols=['ss_perc_sheet']' \
+  model.network.target_channels=1 \
+  discr_batch_ratio=5 \
+  max_epochs=100 \
+  min_epochs=0 \
+  batch_size=64 \
+  dps_enable=False
+
+# for OUR model 
+PYTHONPATH="." python scripts/train_seq_model.py \
+  model=mlm \
+  infill_seeds_fn='/data/cemri/NOS/infill_test_seeds.txt' \
+  model._target_=seq_models.model.mlm_diffusion.MLMDiffusion_DPS \
+  model.optimizer.lr=0.005 \
+  data_dir=/data/cemri/NOS/data \
+  train_fn=train.csv \
+  val_fn=val_iid.csv \
+  vocab_file=/data/cemri/NOS/vocab.txt \
+  log_dir="/data/cemri/NOS/scratch/logs/guided_infill_protein_mlm_ss_perc_sheet_dps_5_ffs" \
+  'target_cols=['ss_perc_sheet']' \
+  model.network.target_channels=1 \
+  discr_batch_ratio=5 \
+  max_epochs=100 \
+  min_epochs=0 \
+  batch_size=64 \
+  dps_enable=True
+  
+
+
 <div>
 <h1> Protein Design with Guided Discrete Diffusion
   
