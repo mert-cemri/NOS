@@ -2,12 +2,10 @@
 for vanilla NOS model 
 ```
 ./final_plot_points.sh
-./final_plot_points_infilling.sh
 ```
 for OUR model 
 ```
 ./final_plot_points_dps.sh
-./final_plot_points_dps_infilling.sh
 ```
 
 ## commands to train:
